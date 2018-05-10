@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.optim
 import torch.nn.functional as F
-from tqdm import tqdm
+from data import scores
 
 
 def load_dataset(data_file):
@@ -67,7 +67,7 @@ def init_vocab(dataset, cutoff=1):
     token_freq = Counter(all_tokens)
     word_types = sorted(token_freq.keys())
 
-    vocab = defaultdict(lambda: 0)
+    vocab = defaultdict(int)
     vocab['<unk>'] = 0
     vocab['<pad>'] = 1
     for word in word_types:
@@ -126,6 +126,9 @@ class BiLSTM_CRF(nn.Module):
 
         self.cuda = cuda
         self.src_vocab = src_vocab
+        self.embed_size = embed_size
+        self.hidden_size = hidden_size
+        self.dropout = dropout
 
         self.src_embed = nn.Embedding(len(src_vocab), embed_size)
         nn.init.xavier_normal(self.src_embed.weight)
@@ -138,7 +141,7 @@ class BiLSTM_CRF(nn.Module):
         nn.init.xavier_normal(self.transition.data)
 
         if dropout:
-            self.dropout = nn.Dropout(dropout)
+            self.dropout_layer = nn.Dropout(dropout)
 
     def forward_algo(self, src_sents, tag_feat_scores):
         # tag_feat_scores: (src_sent_len, batch_size, tag_num)
@@ -241,8 +244,8 @@ class BiLSTM_CRF(nn.Module):
         src_encodings = src_encodings.permute(1, 0, 2)
 
         states = F.tanh(self.enc_to_state(src_encodings))
-        if hasattr(self, 'dropout'):
-            states = self.dropout(states)
+        if self.dropout:
+            states = self.dropout_layer(states)
 
         tag_feat_scores = self.tag_readout(states)
 
@@ -257,10 +260,22 @@ class BiLSTM_CRF(nn.Module):
 
         return loss
 
+    def save(self, path):
+        params = {
+            'args': {'embed_size': self.embed_size,
+                     'hidden_size': self.hidden_size,
+                     'dropout': self.dropout,
+                     'tags': self.tags},
+            'src_vocab': self.src_vocab,
+            'state_dict': self.state_dict()
+        }
+
+        torch.save(params, path)
+
 
 def train(args):
-    train_data = load_dataset('data/train.data')
-    dev_data = load_dataset('data/dev.data')
+    train_data = load_dataset(args.train_data)
+    dev_data = load_dataset(args.dev_data)
     all_tags = sorted(set(chain.from_iterable(x[-1] for x in train_data)))
 
     print('Tags:', ', '.join(all_tags), file=sys.stderr)
@@ -276,6 +291,7 @@ def train(args):
 
     while True:
         epoch += 1
+        total_loss = 0.
         for batch_examples in batch_iter(train_data, batch_size=args.batch_size, shuffle=True):
             iter_num += 1
             optimizer.zero_grad()
@@ -283,6 +299,8 @@ def train(args):
             src_sents = [e[0] for e in batch_examples]
             tgt_tags = [e[-1] for e in batch_examples]
             loss = tagger.get_loss(src_sents, tgt_tags)
+            loss_val = loss.sum().data[0]
+            total_loss += loss_val
             loss = loss.mean()
 
             loss.backward()
@@ -294,8 +312,19 @@ def train(args):
 
             optimizer.step()
 
+        print('[epoch %d] Train loss: %f' % (epoch, total_loss / len(train_data)), file=sys.stderr)
         print('begin evaluation...', file=sys.stderr)
-        evaluate(tagger, dev_data)
+        pred_file = os.path.join(args.save_dir, 'prediction.epoch%d.txt' % epoch)
+        model_file = os.path.join(args.save_dir, 'model.epoch%d.bin' % epoch)
+
+        eval_result = evaluate(tagger, dev_data, output_file=pred_file)
+        print('[epoch %d] Dev acc: %f, prec: %f, recall %f, F1: %f' % (epoch, eval_result[0], eval_result[1], eval_result[2], eval_result[3]),
+              file=sys.stderr)
+
+        dev_loss = get_loss(tagger, dev_data)
+        print('[epoch %d] Dev loss: %f' % (epoch, dev_loss), file=sys.stderr)
+
+        tagger.save(model_file)
 
 
 def decode(model, dataset):
@@ -313,9 +342,27 @@ def decode(model, dataset):
     return decode_results
 
 
-def evaluate(model, dataset):
+def get_loss(model, dataset, batch_size=32):
+    was_training = model.training
+    model.eval()
+
+    total_loss = 0.
+    for batch_examples in batch_iter(dataset, batch_size=batch_size, shuffle=False):
+        src_sents = [e[0] for e in batch_examples]
+        tgt_tags = [e[-1] for e in batch_examples]
+        loss = model.get_loss(src_sents, tgt_tags)
+        loss = loss.sum().data[0]
+        total_loss += loss
+
+    model.train(was_training)
+    total_loss /= len(dataset)
+
+    return total_loss
+
+
+def evaluate(model, dataset, output_file='predictions.txt'):
     decode_results = decode(model, dataset)
-    output_file = 'predictions.txt'
+
     with open(output_file, 'w') as f:
         for example, hyp in zip(dataset, decode_results):
             tokens, pos_tags, syn_tags, ner_labels = example
@@ -325,7 +372,10 @@ def evaluate(model, dataset):
 
             f.write('\n')
 
-    os.system("data/conlleval < %s" % output_file)
+    # os.system("data/conlleval < %s" % output_file)
+    eval_result = scores.scores(output_file)
+
+    return eval_result
 
 
 if __name__ == '__main__':
@@ -338,7 +388,12 @@ if __name__ == '__main__':
     arg_parser.add_argument('--hidden_size', default=256, type=int, help='hidden size')
     arg_parser.add_argument('--dropout', default=0., type=float, help='dropout')
 
+    arg_parser.add_argument('--train_data', default='data/train.data', type=str, help='train_data')
+    arg_parser.add_argument('--dev_data', default='data/dev.data', type=str, help='dev_data')
+    arg_parser.add_argument('--save_dir', default='output', type=str, help='save dir')
+
     args = arg_parser.parse_args()
+    os.system('mkdir -p %s' % args.save_dir)
 
     torch.manual_seed(args.seed)
     if args.cuda:

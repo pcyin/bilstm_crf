@@ -2,7 +2,7 @@ import subprocess
 import sys 
 
 def scores(path):
-  bashCommand = 'perl conlleval'
+  bashCommand = 'perl data/conlleval'
   process = subprocess.Popen(bashCommand.split(), stdout=subprocess.PIPE, stdin=open(path))
   output, error = process.communicate()
   output = output.decode().split('\n')[1].split('%; ')
